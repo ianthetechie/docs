@@ -172,7 +172,10 @@ If it is not possible to use the algorithm specified in the hint, an error is si
 
 <span class="version-tag">New in v19.1</span>: Given multiple identical [indexes](indexes.html) that have different locality constraints using [replication zones](configure-replication-zones.html), the optimizer will prefer the index that is closest to the gateway node that is planning the query. In a properly configured geo-distributed cluster, this can lead to performance improvements due to improved data locality and reduced network traffic.
 
-This feature enables scenarios where reference data such as a table of postal codes can be replicated to different regions, and queries will use the copy in the same region.
+This feature enables scenarios such as:
+
+- Reference data such as a table of postal codes can be replicated to different regions, and queries will use the copy in the same region (See [Example - zone constraints](#example-zone-constraints)).
+- Optimizing for local reads at the expense of writes by adding leaseholder preferences to zone configuration (See [Example - lease preferences](#example-lease-holder-preferences)).
 
 {{site.data.alerts.callout_info}}
 This feature is only available to [enterprise](enterprise-licensing.html) users.
@@ -183,7 +186,7 @@ To take advantage of this feature, you need to:
 1. Have an [enterprise license](enterprise-licensing.html).
 2. Determine which data consists of reference tables that are rarely updated (such as postal codes) and can therefore be easily replicated to different regions.
 3. Create multiple indexes on the reference tables. Note that the indexes need to include (in key or using [`STORED`](create-index.html#store-columns)) the columns that you wish to query.
-4. Create replication zones for each index.
+4. Create replication zones for each index.  If you are confident that you know where 
 
 With the above pieces in place, the optimizer will automatically choose the index nearest the gateway node that is planning the query.
 
@@ -191,7 +194,7 @@ With the above pieces in place, the optimizer will automatically choose the inde
 The optimizer does not actually understand geographic locations, i.e., the relative closeness of the gateway node to other nodes that are located to its "east" or "west". It is matching against the [node locality constraints](configure-replication-zones.html#descriptive-attributes-assigned-to-nodes) you provided when you configured your replication zones.
 {{site.data.alerts.end}}
 
-### Example
+### Example - zone constraints
 
 We can demonstrate the necessary configuration steps using a local cluster. The instructions below assume that you are already familiar with:
 
@@ -327,6 +330,190 @@ $ cockroach sql --insecure --host=localhost --port=26259 --database=test -e 'EXP
 ~~~
 
 You'll need to make changes to the above configuration to reflect your [production environment](recommended-production-settings.html), but the concepts will be the same.
+
+### Example - leaseholder preferences
+
+{{site.data.alerts.callout_info}}
+You should only include the leaseholder preferences part of this feature if you’re confident you know where the leaseholders will end up based on your cluster's usage patterns, since [leaseholders can move](architecture/replication-layer.html#leaseholder-rebalancing).  We recommend testing your configuration to ensure the optimizer is selecting the index(es) you expect.
+{{site.data.alerts.end}}
+
+If you provide [leaseholder preferences](configure-replication-zones.html#leaseholder_prefs) in addition to replication zone constraints, the optimizer will attempt to take your leaseholder preferences into account, with two caveats:
+
+1. Zone constraints are **always** respected (hard constraint), whereas lease preferences are taken into account as long as they don't contradict the zone constraint.
+2. Leaseholder preferences are "best effort".  It may not be possible for the optimizer to use an index that satisfies your leaseholder locality preferences, since leaseholders can move to different nodes.  The optimizer doesn't consider the real-time location of leaseholders; it is pattern matching on the values passed in the configuration.
+
+The instructions below assume that you are already familiar with:
+
+- How to [Start a local cluster](start-a-local-cluster.html).
+- The syntax for [assigning node locality when configuring replication zones](configure-replication-zones.html#descriptive-attributes-assigned-to-nodes).
+- Using [the built-in SQL client](use-the-built-in-sql-client.html).
+
+First, start 3 local nodes as shown below. Use the [`--locality`](start-a-node.html#locality) flag to put them each in a different region as denoted by `region=usa`, `region=eu`, etc.
+
+{% include copy-clipboard.html %}
+~~~ shell
+$ cockroach start --locality=region=us-east  --insecure --store=/tmp/node0 --listen-addr=localhost:26257 --http-port=8888  --join=localhost:26257,localhost:26258,localhost:26259 --background
+~~~
+
+{% include copy-clipboard.html %}
+~~~ shell
+$ cockroach start --locality=region=us-central   --insecure --store=/tmp/node1 --listen-addr=localhost:26258 --http-port=8889  --join=localhost:26257,localhost:26258,localhost:26259 --background
+~~~
+
+{% include copy-clipboard.html %}
+~~~ shell
+$ cockroach start --locality=region=us-west --insecure --store=/tmp/node2 --listen-addr=localhost:26259 --http-port=8890  --join=localhost:26257,localhost:26258,localhost:26259 --background
+~~~
+
+{% include copy-clipboard.html %}
+~~~ shell
+$ cockroach init --insecure --host=localhost --port=26257
+~~~
+
+Next, from the SQL client, add your organization name and enterprise license:
+
+{% include copy-clipboard.html %}
+~~~ sql
+SET CLUSTER SETTING cluster.organization = 'FooCorp - Local Testing';
+~~~
+
+{% include copy-clipboard.html %}
+~~~ sql
+SET CLUSTER SETTING enterprise.license = 'xxxxx';
+~~~
+
+Create a test database and table. The table will have 3 indexes into the same data. Later, we'll configure the cluster to associate each of these indexes with a different datacenter using replication zones.
+
+XXX
+
+
+
+NOTE: If the preference is that a leaseholder is in central, but then it gets moved to east, then the optimizer will still cost as if it's on central. It doesn't consider the real-time location of leaseholders. Because of this, it doesn't matter if you have multiple leaseholder preferences in some order; the CBO only looks at the first.
+
+{% include copy-clipboard.html %}
+~~~ sql
+SELECT version();
+
+CREATE DATABASE if NOT EXISTS auth;
+USE auth;
+
+CREATE TABLE token (
+    token_id VARCHAR(100) NULL,
+    access_token VARCHAR(4000) NULL,
+    refresh_token VARCHAR(4000) NULL
+);
+
+CREATE INDEX token_id_west_idx ON token (token_id) STORING (access_token, refresh_token);
+
+CREATE INDEX token_id_central_idx ON token (token_id) STORING (access_token, refresh_token);
+
+CREATE INDEX token_id_east_idx ON token (token_id) STORING (access_token, refresh_token);
+
+ALTER TABLE token CONFIGURE ZONE USING
+      num_replicas = 5, constraints = '{+region=us-east: 1, +region=us-central: 2, +region=us-west: 2}', lease_preferences = '[[+region=us-west], [+region=us-central]]';
+
+-- Enter license keys to access the ALTER INDEX commands below
+-- (For testing keys see https://cockroachlabs.slack.com/archives/C2C5FKPPB/p1501868500330889)
+
+ALTER INDEX token_id_east_idx CONFIGURE ZONE USING num_replicas = 5,
+      constraints = '{+region=us-east: 2, +region=us-central: 2, +region=us-west: 1}', lease_preferences = '[[+region=us-east], [+region=us-central]]';
+
+ALTER INDEX token_id_central_idx CONFIGURE ZONE USING num_replicas = 5,
+      constraints = '{+region=us-east: 2, +region=us-central: 2, +region=us-west: 1}', lease_preferences = '[[+region=us-central], [+region=us-east]]';
+
+ALTER INDEX token_id_west_idx CONFIGURE ZONE USING num_replicas = 5,
+      constraints = '{+region=us-west: 2, +region=us-central: 2, +region=us-east: 1}', lease_preferences = '[[+region=us-west], [+region=us-central]]';
+
+SHOW ZONE CONFIGURATIONS;
+
+-- Should result in:
+
+--   ... snip ...
+
+--   auth.token                      | ALTER TABLE auth.public.token CONFIGURE ZONE USING                                    
+--                                   |     num_replicas = 5,                                                                 
+--                                   |     constraints = '{+region=us-central: 2, +region=us-east: 1, +region=us-west: 2}',  
+--                                   |     lease_preferences = '[[+region=us-west], [+region=us-central]]'                   
+--   auth.token@token_id_east_idx    | ALTER INDEX auth.public.token@token_id_east_idx CONFIGURE ZONE USING                  
+--                                   |     num_replicas = 5,                                                                 
+--                                   |     constraints = '{+region=us-central: 2, +region=us-east: 2, +region=us-west: 1}',  
+--                                   |     lease_preferences = '[[+region=us-east], [+region=us-central]]'                   
+--   auth.token@token_id_central_idx | ALTER INDEX auth.public.token@token_id_central_idx CONFIGURE ZONE USING               
+--                                   |     num_replicas = 5,                                                                 
+--                                   |     constraints = '{+region=us-central: 2, +region=us-east: 2, +region=us-west: 1}',  
+--                                   |     lease_preferences = '[[+region=us-central], [+region=us-east]]'                   
+--   auth.token@token_id_west_idx    | ALTER INDEX auth.public.token@token_id_west_idx CONFIGURE ZONE USING                  
+--                                   |     num_replicas = 5,                                                                 
+--                                   |     constraints = '{+region=us-central: 2, +region=us-east: 1, +region=us-west: 2}',  
+--                                   |     lease_preferences = '[[+region=us-west], [+region=us-central]]'                   
+-- (10 rows)
+
+-- Time: 29.718ms
+
+-- Run the inserts below from the central node
+
+INSERT INTO TOKEN (token_id, access_token, refresh_token) SELECT gen_random_uuid()::STRING, gen_random_uuid()::STRING, gen_random_uuid()::STRING FROM generate_series(1, 10000);
+
+UPSERT
+INTO
+    token (token_id, access_token, refresh_token)
+VALUES
+    (
+        'DE32D09E-5C92-11E9-83EA-8E9B5FAC1A65',
+        '5106F0DC-5C93-11E9-9430-508660AC1A65',
+        '581E11F2-5C93-11E9-BA89-568660AC1A65'
+    );
+
+UPSERT
+INTO
+    token (token_id, access_token, refresh_token)
+VALUES
+    (
+        '85748136-5C93-11E9-888B-678660AC1A65',
+        '8AC3048C-5C93-11E9-90C5-6D8660AC1A65',
+        '8FB28A1C-5C93-11E9-81BE-738660AC1A65'
+    );
+
+UPSERT
+INTO
+    token (token_id, access_token, refresh_token)
+VALUES
+    (
+        '2E1B5BFE-6152-11E9-B9FD-A7E0F13211D9',
+        '49E36152-6152-11E9-8CDC-3682F23211D9',
+        '4E0E91B6-6152-11E9-BAC1-3782F23211D9'
+    );
+
+-- Run the explain from the central node.  Expectations:
+-- 1. It will use the central or east indexes, in that order.
+-- 2. Doing the writes from the central node means the leaseholders are on the central node
+
+EXPLAIN
+    SELECT
+        access_token, refresh_token
+    FROM
+        token
+    WHERE
+        token_id = '2E1B5BFE-6152-11E9-B9FD-A7E0F13211D9';
+
+-- Actual output shows west and central indexes used despite leaseholder prefs (?)
+--
+--          tree       |   field   |                 description                  
+-- +------------------+-----------+---------------------------------------------+
+--   render           |           |                                              
+--    └── zigzag-join |           |                                              
+--         │          | type      | inner                                        
+--         │          | pred      | @1 = '2E1B5BFE-6152-11E9-B9FD-A7E0F13211D9'  
+--         ├── scan   |           |                                              
+--         │          | table     | token@token_id_west_idx                      
+--         │          | fixedvals | 1 column                                     
+--         └── scan   |           |                                              
+--                    | table     | token@token_id_central_idx                   
+--                    | fixedvals | 1 column                                     
+-- (10 rows)
+
+-- Time: 754µs
+~~~
 
 ## How to turn the optimizer off
 
